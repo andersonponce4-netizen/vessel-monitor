@@ -103,9 +103,26 @@ def download_one_sheet() -> list[dict] | None:
         r = requests.get(url, timeout=30, allow_redirects=True)
         r.raise_for_status()
         text = r.content.decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(text))
+
+        # El sheet puede tener filas de título vacías antes de los encabezados reales.
+        # Buscamos la primera fila que tenga al menos 2 celdas con contenido.
+        lines = text.splitlines()
+        start = 0
+        for i, line in enumerate(lines):
+            cells = [c.strip() for c in line.split(",")]
+            non_empty = sum(1 for c in cells if c)
+            if non_empty >= 2:
+                start = i
+                break
+        actual_text = "\n".join(lines[start:])
+        log.info("ONE Sheet: fila de encabezados detectada en línea %d", start)
+
+        reader = csv.DictReader(io.StringIO(actual_text))
         rows = list(reader)
-        log.info("ONE Sheet: %d filas descargadas", len(rows))
+        if rows:
+            log.info("ONE Sheet: %d filas, columnas: %s", len(rows), list(rows[0].keys()))
+        else:
+            log.warning("ONE Sheet: 0 filas tras parseo")
         CACHE_DIR.mkdir(exist_ok=True)
         cache_path = CACHE_DIR / f"one_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         cache_path.write_text(text, encoding="utf-8")
@@ -361,10 +378,20 @@ def parse_amc_pdf(pdf_bytes: bytes) -> list[dict]:
                 # Extraer tabla
                 tables = page.extract_tables()
                 for table in tables:
-                    if not table or len(table) < 2:
+                    # Necesitamos al menos: fila-título + fila-encabezados + 1 fila de datos
+                    if not table or len(table) < 3:
                         continue
-                    # Primera fila como encabezados
-                    headers = [str(h).upper().strip() if h else "" for h in table[0]]
+
+                    # ── Fila 0: título de semana ─────────────────────────────
+                    # Ej: ['Week # 37', '07 de Septiembre al 13 de Septiembre', None, ...]
+                    title_cell = str(table[0][0] or "")
+                    wk_m_tbl = re.search(r"Week\s*#\s*(\d+)", title_cell, re.IGNORECASE)
+                    if wk_m_tbl:
+                        current_wk = int(wk_m_tbl.group(1))
+
+                    # ── Fila 1: encabezados reales ───────────────────────────
+                    # Ej: ['Vessel','Voyage','Port of Loading','ETA','ETB','ETS','MRN','Cut Off','Service']
+                    headers = [str(h).upper().strip() if h else "" for h in table[1]]
 
                     # Índices de columnas clave (flexibles)
                     def col_idx(candidates):
@@ -376,17 +403,20 @@ def parse_amc_pdf(pdf_bytes: bytes) -> list[dict]:
 
                     i_vessel = col_idx(["VESSEL","NAVE"])
                     i_voyage = col_idx(["VOYAGE","VIAJE"])
-                    i_pol    = col_idx(["POL","TERMINAL","PORT"])
+                    i_pol    = col_idx(["POL","TERMINAL","PORT OF LOADING","PORT"])
                     i_eta    = col_idx(["ETA","ARRIBO"])
                     i_ets    = col_idx(["ETS","ZARPE","ETD"])
                     i_mrn    = col_idx(["MRN","BOOKING REF"])
-                    i_dry    = col_idx(["DRY","CO DRY","CARGA SECA"])
-                    i_rf     = col_idx(["RF","REEFER","CO RF","CO REF"])
+                    # El PDF de AMC tiene una sola columna "Cut Off" para DRY y REEFER
+                    i_dry    = col_idx(["CO DRY","DRY","CARGA SECA","CUT OFF"])
+                    i_rf     = col_idx(["CO RF","CO REF","REEFER","RF","CUT OFF"])
+                    i_svc    = col_idx(["SERVICE","SERVICIO","SVC"])
 
                     if i_vessel is None:
+                        log.debug("Tabla sin columna VESSEL — omitida. Headers: %s", headers)
                         continue  # no es tabla de naves
 
-                    for row in table[1:]:
+                    for row in table[2:]:
                         def cell(idx):
                             if idx is None or idx >= len(row):
                                 return ""
@@ -403,6 +433,12 @@ def parse_amc_pdf(pdf_bytes: bytes) -> list[dict]:
                         zarpe   = cell(i_ets) or "POR CONFIRMAR"
                         arribo  = cell(i_eta) or "—"
                         term    = normalize_terminal(cell(i_pol))
+
+                        # Usar servicio de la columna SERVICE si está disponible,
+                        # si no, conservar el servicio detectado en el texto de la página
+                        row_svc = cell(i_svc).strip() if i_svc is not None else ""
+                        if row_svc:
+                            current_svc = row_svc
 
                         status = "pend" if "CONFIRMAR" in (co_dry+co_rf+zarpe).upper() else "ok"
 
