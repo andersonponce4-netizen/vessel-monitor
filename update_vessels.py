@@ -12,6 +12,7 @@ Requisitos: pip install requests pdfplumber
 PROTOTIPO EXPLORATORIO — ver README.md antes de usar en producción.
 """
 
+import os
 import requests
 import json
 import base64
@@ -35,7 +36,7 @@ except ImportError:
 #  CONFIGURACIÓN  (editar antes de usar)
 # ════════════════════════════════════════════════════════
 
-GITHUB_TOKEN = "TU_TOKEN_AQUI"                    # Personal Access Token de GitHub
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # Personal Access Token de GitHub (variable de entorno)
 GITHUB_REPO  = "andersonponce4-netizen/vessel-monitor"
 GITHUB_FILE  = "data.json"
 
