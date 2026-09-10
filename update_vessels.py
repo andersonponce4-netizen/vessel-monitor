@@ -92,8 +92,13 @@ def download_amc_pdf() -> bytes | None:
         return None
 
 
-def download_one_sheet() -> list[dict] | None:
-    """Descarga el Google Sheet de ONE como CSV y retorna lista de filas."""
+def download_one_sheet() -> list[list[str]] | None:
+    """
+    Descarga el Google Sheet de ONE como CSV.
+    Retorna lista de filas (cada fila = lista de celdas).
+    El sheet usa una matriz visual compleja — se devuelven filas brutas,
+    NO se usa DictReader (los encabezados no son la primera fila).
+    """
     log.info("Descargando Google Sheet ONE...")
     url = (
         f"https://docs.google.com/spreadsheets/d/{ONE_SHEET_ID}"
@@ -104,28 +109,13 @@ def download_one_sheet() -> list[dict] | None:
         r.raise_for_status()
         text = r.content.decode("utf-8-sig")
 
-        # El sheet puede tener filas de título vacías antes de los encabezados reales.
-        # Buscamos la primera fila que tenga al menos 2 celdas con contenido.
-        lines = text.splitlines()
-        start = 0
-        for i, line in enumerate(lines):
-            cells = [c.strip() for c in line.split(",")]
-            non_empty = sum(1 for c in cells if c)
-            if non_empty >= 2:
-                start = i
-                break
-        actual_text = "\n".join(lines[start:])
-        log.info("ONE Sheet: fila de encabezados detectada en línea %d", start)
-
-        reader = csv.DictReader(io.StringIO(actual_text))
-        rows = list(reader)
-        if rows:
-            log.info("ONE Sheet: %d filas, columnas: %s", len(rows), list(rows[0].keys()))
-        else:
-            log.warning("ONE Sheet: 0 filas tras parseo")
         CACHE_DIR.mkdir(exist_ok=True)
         cache_path = CACHE_DIR / f"one_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         cache_path.write_text(text, encoding="utf-8")
+
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        log.info("ONE Sheet: %d filas brutas descargadas", len(rows))
         return rows
     except Exception as e:
         log.error("Error descargando ONE Sheet: %s", e)
@@ -176,73 +166,235 @@ def parse_one_date(val: str | None) -> str:
     return val  # devolver tal cual si no se pudo parsear
 
 
-def parse_one_sheet(rows: list[dict]) -> list[dict]:
-    """Convierte filas del CSV de ONE a la estructura del dashboard."""
-    vessels = []
-    # Detectar semana actual y siguiente desde la fecha de hoy
-    now = datetime.now()
-    week_now = now.isocalendar()[1]
+# ── Helpers internos para parseo de matriz ONE ────────────────────────────────
 
+def _is_date_val(s: str) -> bool:
+    """Detecta si una celda es una fecha d/m/yyyy."""
+    return bool(re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', (s or '').strip()))
+
+def _is_time_val(s: str) -> bool:
+    """Detecta si una celda es una hora h:mm o h:mm:ss."""
+    return bool(re.match(r'^\d{1,2}:\d{2}(:\d{2})?$', (s or '').strip()))
+
+def _is_omision_one(s: str) -> bool:
+    su = (s or '').upper()
+    return 'OMISI' in su or 'BLANK' in su
+
+def _pad_row(row: list, n: int = 28) -> list:
+    """Extiende una fila a n columnas con cadenas vacías."""
+    return (list(row) + [''] * n)[:n]
+
+def _fmt_one_date(day: str, date: str, time: str) -> str:
+    """
+    Combina día-de-semana, fecha y hora en cadena legible.
+    Ej: "Domingo 13/09/2026 20:00"
+    Retorna "—" si hay omisión, "POR CONFIRMAR" si no hay fecha.
+    """
+    day  = (day  or '').strip()
+    date = (date or '').strip()
+    time = (time or '').strip()
+
+    if _is_omision_one(day) or _is_omision_one(date):
+        return '—'
+
+    parts = []
+    if day and not _is_date_val(day) and not _is_time_val(day):
+        parts.append(day.capitalize())
+    if date and _is_date_val(date):
+        try:
+            d, m, y = date.split('/')
+            parts.append(f"{int(d):02d}/{int(m):02d}/{y}")
+        except Exception:
+            parts.append(date)
+    if time and _is_time_val(time):
+        t = time.split(':')
+        parts.append(f"{t[0]}:{t[1]}")
+
+    return ' '.join(parts) if parts else 'POR CONFIRMAR'
+
+def _is_past_one(date_str: str) -> bool:
+    """Evalúa si una fecha en formato ONE ('Domingo 13/09/2026 20:00') ya pasó."""
+    if not date_str or date_str in ('—', 'POR CONFIRMAR', ''):
+        return False
+    m = re.search(r'(\d{2})/(\d{2})/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?', date_str)
+    if m:
+        try:
+            day, mon, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            hr = int(m.group(4)) if m.group(4) else 0
+            mi = int(m.group(5)) if m.group(5) else 0
+            return datetime(yr, mon, day, hr, mi) < datetime.now()
+        except Exception:
+            return False
+    return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_one_sheet(raw_rows: list[list[str]]) -> list[dict]:
+    """
+    Parsea el Google Sheet de ONE Ecuador (formato matriz visual).
+
+    Estructura del CSV exportado:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ Fila 0   : vacía                                                │
+    │ Fila 1   : col[1]="WEEK 37"  col[15~]="WEEK 38"                │
+    │ Filas 2-12: branding/logo, vacías                               │
+    │ Fila 13  : encabezados — col[2]=SERVICIO  col[3]=NAVE/VIAJE    │
+    │ Filas 14+: bloques de 3 filas por nave:                         │
+    │   Fila A: SERVICIO, NAVE/VIAJE, TERMINAL + día-semana en dates │
+    │   Fila B: fechas (dd/m/yyyy) en columnas de fecha              │
+    │   Fila C: horas  (h:mm:ss)   en columnas de fecha              │
+    └─────────────────────────────────────────────────────────────────┘
+
+    Columnas W37 (0-based): 2=SVC 3=NAVE 4=TERM 5=ARRIBO 6=ZARPE
+                             7=CO_DRY 8=CO_RF
+    Columnas W38 (0-based): 18=SVC 19=NAVE 20=TERM 21=ARRIBO 22=ZARPE
+                             23=CO_DRY 24=CO_RF
+
+    REGLAS DE NEGOCIO:
+    - "Omisión de Recalada" en col 5 → nave omitida (W37)
+    - "Blank Sailing"       en col 19 → nave omitida (W38)
+    - Col 3 vacía pero col 19 con nave → entrada solo W38;
+      hereda SERVICIO del último bloque W38 conocido.
+    """
+    vessels  = []
+    vessel_id = 1000
+
+    rows = [_pad_row(r) for r in raw_rows]
+
+    # ── Detectar números de semana (fila 1, índice 1) ─────────────────
+    wk37 = wk38 = 0
+    if len(rows) > 1:
+        for j, cell in enumerate(rows[1]):
+            m = re.search(r'WEEK\s*(\d+)', cell.strip(), re.IGNORECASE)
+            if m:
+                wk_num = int(m.group(1))
+                if j < 15:
+                    wk37 = wk_num
+                else:
+                    wk38 = wk_num
+    log.info("ONE: semanas detectadas W37=%s, W38=%s", wk37, wk38)
+
+    # ── Encontrar fila de encabezados ─────────────────────────────────
+    header_idx = None
     for i, row in enumerate(rows):
-        nave    = find_col(row, ONE_COL_MAP["nave"])
-        viaje   = find_col(row, ONE_COL_MAP["viaje"])
-        svc     = find_col(row, ONE_COL_MAP["svc"])
-        term    = find_col(row, ONE_COL_MAP["terminal"])
-        arribo  = find_col(row, ONE_COL_MAP["arribo"])
-        zarpe   = find_col(row, ONE_COL_MAP["zarpe"])
-        co_dry  = find_col(row, ONE_COL_MAP["co_dry"])
-        co_rf   = find_col(row, ONE_COL_MAP["co_rf"])
-        semana  = find_col(row, ONE_COL_MAP["semana"])
+        if 'SERVICIO' in row[2].upper() and 'NAVE' in row[3].upper():
+            header_idx = i
+            break
+    if header_idx is None:
+        log.warning("ONE: no se encontró fila de encabezados (SERVICIO/NAVE)")
+        return []
+    log.info("ONE: encabezados en fila %d", header_idx)
 
-        if not nave or not nave.strip():
-            continue  # saltar filas vacías / encabezados intermedios
+    # ── Procesar bloques de datos ─────────────────────────────────────
+    data = rows[header_idx + 1:]
+    current_svc_37 = ''
+    current_svc_38 = ''
+    i = 0
 
-        # Determinar número de semana
-        wk = int(semana) if semana and semana.strip().isdigit() else week_now
+    while i < len(data):
+        row = data[i]
 
-        # Detectar omisión de recalada
-        is_skip = any(kw in str(arribo).upper() for kw in
-                      ["OMISION", "OMISIÓN", "BLANK", "SKIP", "NO ESCALA"])
+        if all(c == '' for c in row):
+            i += 1
+            continue
 
-        arribo_fmt = "—" if is_skip else parse_one_date(arribo)
-        zarpe_fmt  = "—" if is_skip else parse_one_date(zarpe)
-        co_dry_fmt = "—" if is_skip else parse_one_date(co_dry)
-        co_rf_fmt  = "—" if is_skip else parse_one_date(co_rf)
+        nave37 = row[3].strip()
+        nave38 = row[19].strip()
 
-        status = "skip" if is_skip else (
-            "pend" if "POR CONFIRMAR" in (co_dry_fmt + co_rf_fmt) else "ok"
-        )
+        is_v37 = nave37 and not _is_date_val(nave37) and not _is_time_val(nave37)
+        is_v38 = nave38 and not _is_date_val(nave38) and not _is_time_val(nave38)
 
-        # Detectar carrier por nombre de nave o servicio
-        carrier = detect_carrier_one(nave, svc)
+        if not is_v37 and not is_v38:
+            i += 1
+            continue
 
-        # Detectar si cut-off ya venció
-        co_dry_past = is_past(co_dry_fmt)
-        co_rf_past  = is_past(co_rf_fmt)
+        # Fila A — información de nave
+        vessel_row = row
+        if row[2].strip():
+            current_svc_37 = row[2].strip()
+        if row[18].strip():
+            current_svc_38 = row[18].strip()
+        term37 = row[4].strip()
+        term38 = row[20].strip()
 
-        vessels.append({
-            "id":          1000 + i,
-            "wk":          wk,
-            "carrier":     carrier,
-            "nave":        nave.strip(),
-            "viaje":       (viaje or "").strip(),
-            "terminal":    normalize_terminal(term),
-            "svc":         (svc or "").strip(),
-            "dest":        dest_from_svc(svc),
-            "arribo":      arribo_fmt,
-            "zarpe":       zarpe_fmt,
-            "zarpe_prev":  None,
-            "co_dry":      co_dry_fmt,
-            "co_dry_prev": None,
-            "co_dry_past": co_dry_past,
-            "co_rf":       co_rf_fmt,
-            "co_rf_prev":  None,
-            "co_rf_past":  co_rf_past,
-            "mrn":         "—",
-            "fuente":      "ONE",
-            "status":      status,
-            "nota":        "Omisión de recalada confirmada por ONE." if is_skip else None,
-        })
+        # Buscar filas B (fechas) y C (horas) a continuación
+        date_row = _pad_row([])
+        time_row = _pad_row([])
+        j = i + 1
+        while j < len(data) and j <= i + 3:
+            nr = data[j]
+            # Parar si es otra fila de nave
+            if ((nr[3].strip() and not _is_date_val(nr[3]) and not _is_time_val(nr[3])) or
+                    (nr[19].strip() and not _is_date_val(nr[19]) and not _is_time_val(nr[19]))):
+                break
+            has_date = _is_date_val(nr[5]) or _is_date_val(nr[21])
+            has_time = _is_time_val(nr[5]) or _is_time_val(nr[21])
+            if has_date:
+                date_row = _pad_row(nr)
+                j += 1
+                if j < len(data) and (_is_time_val(data[j][5]) or _is_time_val(data[j][21])):
+                    time_row = _pad_row(data[j])
+                    j += 1
+                break
+            elif has_time:
+                time_row = _pad_row(nr)
+                j += 1
+                break
+            j += 1
+        i = j
+
+        def _build_vessel(wk, svc, nave, term, c_arr, c_zar, c_dry, c_rf):
+            """Construye el dict de nave para el dashboard."""
+            if _is_omision_one(vessel_row[c_arr]):
+                a = z = d = rf = '—'
+                st, nota = 'skip', 'Omisión de recalada confirmada por ONE.'
+            elif _is_omision_one(nave):
+                a = z = d = rf = '—'
+                nave = f'{svc} Blank Sailing'
+                st, nota = 'skip', 'Blank Sailing.'
+            else:
+                a  = _fmt_one_date(vessel_row[c_arr], date_row[c_arr], time_row[c_arr])
+                z  = _fmt_one_date(vessel_row[c_zar], date_row[c_zar], time_row[c_zar])
+                d  = _fmt_one_date(vessel_row[c_dry], date_row[c_dry], time_row[c_dry])
+                rf = _fmt_one_date(vessel_row[c_rf],  date_row[c_rf],  time_row[c_rf])
+                st = 'pend' if 'CONFIRMAR' in (d + rf) else 'ok'
+                nota = None
+
+            vm = re.search(r'\s+(\d{4}[EWNS]?)$', nave)
+            viaje = vm.group(1) if vm else ''
+
+            return {
+                'id':          vessel_id,
+                'wk':          wk,
+                'carrier':     detect_carrier_one(nave, svc),
+                'nave':        nave,
+                'viaje':       viaje,
+                'terminal':    normalize_terminal(term),
+                'svc':         svc,
+                'dest':        dest_from_svc(svc),
+                'arribo':      a,
+                'zarpe':       z,
+                'zarpe_prev':  None,
+                'co_dry':      d,
+                'co_dry_prev': None,
+                'co_dry_past': _is_past_one(d),
+                'co_rf':       rf,
+                'co_rf_prev':  None,
+                'co_rf_past':  _is_past_one(rf),
+                'mrn':         '—',
+                'fuente':      'ONE',
+                'status':      st,
+                'nota':        nota,
+            }
+
+        if is_v37:
+            vessels.append(_build_vessel(wk37, current_svc_37, nave37, term37,
+                                         5, 6, 7, 8))
+            vessel_id += 1
+        if is_v38:
+            vessels.append(_build_vessel(wk38, current_svc_38, nave38, term38,
+                                         21, 22, 23, 24))
+            vessel_id += 1
 
     log.info("ONE Sheet parseado: %d naves", len(vessels))
     return vessels
