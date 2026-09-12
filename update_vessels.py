@@ -21,6 +21,9 @@ import io
 import re
 import sys
 import logging
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +40,7 @@ except ImportError:
 # ════════════════════════════════════════════════════════
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # Personal Access Token de GitHub (variable de entorno)
-GITHUB_REPO  = "andersonponce4-netizen/vessel-monitor"
+GITHUB_REPO  = "transoceanica-ec/vessel-monitor"
 GITHUB_FILE  = "data.json"
 
 # URL pública del PDF de AMC (sin login requerido)
@@ -52,6 +55,23 @@ ONE_SHEET_GID = "28461025"
 
 # Directorio local para guardar copias de las fuentes
 CACHE_DIR = Path(__file__).parent / "cache"
+
+# ── Configuración de notificaciones por correo ───────────
+# Remitente: cuenta Gmail con contraseña de aplicación guardada como
+# variable de entorno GMAIL_APP_PASSWORD (nunca hardcodeada aquí).
+GMAIL_SENDER       = "monitornaves.gt@gmail.com"
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+# Destinatarios — agregar o quitar direcciones según se necesite
+NOTIFY_TO = [
+    "aponce@transoceanica.com.ec",
+    "pbedoya@transoceanica.com.ec",
+    "aescudero@transoceanica.com.ec",
+    "jpena@transoceanica.com.ec",
+]
+
+# Campos que se monitorean para detectar cambios
+CAMPOS_MONITOREADOS = ["arribo", "zarpe", "co_dry", "co_rf", "status"]
 
 # ════════════════════════════════════════════════════════
 #  LOGGING
@@ -672,8 +692,12 @@ def merge_vessels(amc: list[dict], one: list[dict]) -> list[dict]:
 #  PUBLICAR EN GITHUB
 # ════════════════════════════════════════════════════════
 
-def push_to_github(data: list[dict]) -> bool:
-    """Sube data.json al repositorio GitHub via API."""
+def push_to_github(data: list[dict], last_changes_at: str | None = None) -> bool:
+    """
+    Sube data.json al repositorio GitHub via API.
+    last_changes_at: ISO timestamp de cuándo se detectó el último cambio real.
+                     Se preserva del ciclo anterior si no hubo cambios nuevos.
+    """
     if GITHUB_TOKEN == "TU_TOKEN_AQUI":
         log.error("GITHUB_TOKEN no configurado. Edita update_vessels.py.")
         return False
@@ -693,14 +717,18 @@ def push_to_github(data: list[dict]) -> bool:
         log.error("Error leyendo GitHub: %s %s", r.status_code, r.text[:200])
         return False
 
-    payload_str = json.dumps({
+    payload: dict = {
         "vessels": data,
         "updated_at": datetime.now().isoformat(),
         "sources": {
             "amc_url": AMC_PDF_URL,
             "one_sheet": f"https://docs.google.com/spreadsheets/d/{ONE_SHEET_ID}",
-        }
-    }, ensure_ascii=False, indent=2)
+        },
+    }
+    if last_changes_at:
+        payload["last_changes_at"] = last_changes_at
+
+    payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
 
     body = {
         "message": f"auto-update {datetime.now().strftime('%Y-%m-%d %H:%M')} EC",
@@ -718,17 +746,249 @@ def push_to_github(data: list[dict]) -> bool:
         return False
 
 # ════════════════════════════════════════════════════════
+#  NOTIFICACIONES
+# ════════════════════════════════════════════════════════
+
+def fetch_current_data() -> tuple[list[dict], str | None]:
+    """
+    Descarga el data.json actual de GitHub.
+    Retorna (vessels, last_changes_at) — last_changes_at es None si no existe aún.
+    """
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+    try:
+        r = requests.get(api_url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+            return data.get("vessels", []), data.get("last_changes_at")
+        return [], None
+    except Exception as e:
+        log.warning("No se pudo obtener data.json anterior: %s", e)
+        return [], None
+
+
+def apply_changes_to_vessels(vessels: list[dict], cambios: dict) -> None:
+    """
+    Marca directamente en la lista de naves cuáles tuvieron cambios detectados.
+    Modifica en-place: status='mod', campos *_prev con valor anterior, nota con resumen.
+    Esto permite que el dashboard muestre el contador MODIFICADAS y el detalle visual.
+
+    REGLA DE NEGOCIO: solo se marcan cambios de campos monitoreados (arribo, zarpe,
+    co_dry, co_rf). El estado 'mod' se sobreescribe en el siguiente ciclo sin cambios.
+    """
+    labels = {
+        "arribo": "Arribo EC",
+        "zarpe":  "Zarpe EC",
+        "co_dry": "Cut Off DRY",
+        "co_rf":  "Cut Off Reefer",
+    }
+
+    # Índice de cambios por clave (nave normalizada, semana)
+    cambios_idx = {}
+    for c in cambios["cambios"]:
+        k = (re.sub(r"\s+", " ", c["nave"]["nave"].upper().strip()), c["nave"]["wk"])
+        cambios_idx[k] = c["diffs"]
+
+    for v in vessels:
+        k = (re.sub(r"\s+", " ", v["nave"].upper().strip()), v["wk"])
+        if k not in cambios_idx:
+            continue
+        diffs = cambios_idx[k]
+        v["status"] = "mod"
+        if "zarpe"  in diffs: v["zarpe_prev"]  = diffs["zarpe"]["antes"]
+        if "co_dry" in diffs: v["co_dry_prev"] = diffs["co_dry"]["antes"]
+        if "co_rf"  in diffs: v["co_rf_prev"]  = diffs["co_rf"]["antes"]
+        if "arribo" in diffs: v["arribo_prev"]  = diffs["arribo"]["antes"]
+        partes_nota = [
+            f"{labels.get(campo, campo)}: {d['antes']} → {d['ahora']}"
+            for campo, d in diffs.items()
+        ]
+        v["nota"] = " | ".join(partes_nota)
+
+
+def detect_changes(old: list[dict], new: list[dict]) -> dict:
+    """
+    Compara la lista anterior con la nueva y retorna un dict con:
+    - nuevas:    naves que aparecen por primera vez
+    - cambios:   naves con modificaciones en campos monitoreados
+    - blank:     naves que pasaron a Blank Sailing u Omisión
+    """
+    # Indexar por (nave normalizada, semana)
+    def key(v):
+        return (re.sub(r"\s+", " ", v["nave"].upper().strip()), v["wk"])
+
+    old_idx = {key(v): v for v in old}
+    new_idx = {key(v): v for v in new}
+
+    nuevas  = []
+    cambios = []
+    blank   = []
+
+    for k, v_new in new_idx.items():
+        if k not in old_idx:
+            if v_new.get("status") != "skip":
+                nuevas.append(v_new)
+            else:
+                blank.append(v_new)
+            continue
+
+        v_old = old_idx[k]
+
+        # Detectar paso a skip (blank sailing / omisión)
+        if v_old.get("status") != "skip" and v_new.get("status") == "skip":
+            blank.append(v_new)
+            continue
+
+        # Detectar cambios en fechas
+        diffs = {}
+        for campo in ["arribo", "zarpe", "co_dry", "co_rf"]:
+            val_old = (v_old.get(campo) or "").strip()
+            val_new = (v_new.get(campo) or "").strip()
+            if val_old != val_new and val_new not in ("", "—", "POR CONFIRMAR"):
+                diffs[campo] = {"antes": val_old or "—", "ahora": val_new}
+        if diffs:
+            cambios.append({"nave": v_new, "diffs": diffs})
+
+    return {"nuevas": nuevas, "cambios": cambios, "blank": blank}
+
+
+def _label(campo: str) -> str:
+    return {
+        "arribo": "Arribo EC",
+        "zarpe":  "Zarpe EC",
+        "co_dry": "Cut Off DRY",
+        "co_rf":  "Cut Off Reefer",
+    }.get(campo, campo)
+
+
+def build_email_html(cambios: dict, timestamp: str) -> str:
+    """Genera el cuerpo HTML del correo de notificación."""
+    nuevas  = cambios["nuevas"]
+    updates = cambios["cambios"]
+    blank   = cambios["blank"]
+
+    secciones = []
+
+    if nuevas:
+        filas = "".join(
+            f"<tr><td>{v['nave']}</td><td>{v['svc']}</td>"
+            f"<td>Sem {v['wk']}</td><td>{v['arribo']}</td>"
+            f"<td>{v['zarpe']}</td><td>{v['co_dry']}</td><td>{v['co_rf']}</td></tr>"
+            for v in nuevas
+        )
+        secciones.append(f"""
+        <h3 style="color:#1a6e36">🆕 Naves nuevas ({len(nuevas)})</h3>
+        <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+          <tr style="background:#d4edda"><th>Nave</th><th>Servicio</th><th>Semana</th>
+          <th>Arribo EC</th><th>Zarpe EC</th><th>CO DRY</th><th>CO Reefer</th></tr>
+          {filas}
+        </table>""")
+
+    if updates:
+        filas = "".join(
+            "<tr><td>{nave}</td><td>{svc}</td><td>Sem {wk}</td><td>{campos}</td></tr>".format(
+                nave=c["nave"]["nave"],
+                svc=c["nave"]["svc"],
+                wk=c["nave"]["wk"],
+                campos="<br>".join(
+                    f"<b>{_label(k)}</b>: {d['antes']} → {d['ahora']}"
+                    for k, d in c["diffs"].items()
+                )
+            )
+            for c in updates
+        )
+        secciones.append(f"""
+        <h3 style="color:#856404">✏️ Fechas actualizadas ({len(updates)})</h3>
+        <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+          <tr style="background:#fff3cd"><th>Nave</th><th>Servicio</th><th>Semana</th><th>Cambios</th></tr>
+          {filas}
+        </table>""")
+
+    if blank:
+        filas = "".join(
+            f"<tr><td>{v['nave']}</td><td>{v['svc']}</td><td>Sem {v['wk']}</td>"
+            f"<td>{v.get('nota','—')}</td></tr>"
+            for v in blank
+        )
+        secciones.append(f"""
+        <h3 style="color:#721c24">⚠️ Blank Sailing / Omisión ({len(blank)})</h3>
+        <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+          <tr style="background:#f8d7da"><th>Nave</th><th>Servicio</th><th>Semana</th><th>Motivo</th></tr>
+          {filas}
+        </table>""")
+
+    cuerpo = "\n".join(secciones)
+    return f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;max-width:900px;margin:auto">
+      <h2 style="border-bottom:2px solid #003366;padding-bottom:8px">
+        Monitor de Naves EC — Actualizaciones detectadas
+      </h2>
+      <p style="color:#666;font-size:12px">Generado: {timestamp} |
+         <a href="https://transoceanica-ec.github.io/vessel-monitor/">Ver dashboard</a></p>
+      {cuerpo}
+      <hr>
+      <p style="font-size:11px;color:#999">
+        Este correo es generado automáticamente por el Monitor de Naves GT.<br>
+        Fuentes: AMC (CMA-CGM Ecuador) + Google Sheet ONE Ecuador.
+      </p>
+    </body></html>
+    """
+
+
+def send_notification(cambios: dict) -> bool:
+    """Envía el correo de notificación si hay cambios. Retorna True si se envió."""
+    total = len(cambios["nuevas"]) + len(cambios["cambios"]) + len(cambios["blank"])
+    if total == 0:
+        log.info("Sin cambios detectados — no se envía notificación.")
+        return False
+
+    if not GMAIL_APP_PASSWORD:
+        log.warning("GMAIL_APP_PASSWORD no configurada — notificación omitida.")
+        return False
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    partes = []
+    if cambios["nuevas"]:  partes.append(f"{len(cambios['nuevas'])} nave(s) nueva(s)")
+    if cambios["cambios"]: partes.append(f"{len(cambios['cambios'])} actualización(es) de fechas")
+    if cambios["blank"]:   partes.append(f"{len(cambios['blank'])} Blank Sailing/Omisión")
+    asunto = f"[Monitor Naves GT] {' | '.join(partes)}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = asunto
+    msg["From"]    = GMAIL_SENDER
+    msg["To"]      = ", ".join(NOTIFY_TO)
+    msg.attach(MIMEText(build_email_html(cambios, timestamp), "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_SENDER, GMAIL_APP_PASSWORD.replace(" ", ""))
+            smtp.sendmail(GMAIL_SENDER, NOTIFY_TO, msg.as_string())
+        log.info("Notificación enviada a %s (%s)", NOTIFY_TO, asunto)
+        return True
+    except Exception as e:
+        log.error("Error enviando notificación: %s", e)
+        return False
+
+
+# ════════════════════════════════════════════════════════
 #  MAIN
 # ════════════════════════════════════════════════════════
 
 def main():
     log.info("═══ Inicio actualización %s ═══", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-    # 1. Descargar fuentes
+    # 1. Obtener datos actuales (para comparar después)
+    old_vessels, prev_last_changes_at = fetch_current_data()
+    log.info("Datos anteriores: %d naves en GitHub", len(old_vessels))
+
+    # 2. Descargar fuentes
     pdf_bytes = download_amc_pdf()
     one_rows  = download_one_sheet()
 
-    # 2. Parsear
+    # 3. Parsear
     amc_vessels = parse_amc_pdf(pdf_bytes) if pdf_bytes else []
     one_vessels = parse_one_sheet(one_rows) if one_rows else []
 
@@ -736,22 +996,42 @@ def main():
         log.error("No se obtuvo datos de ninguna fuente. Abortando.")
         sys.exit(1)
 
-    # 3. Merge
+    # 4. Merge
     vessels = merge_vessels(amc_vessels, one_vessels)
     log.info("Total naves tras merge: %d", len(vessels))
 
-    # 4. Guardar copia local
+    # 5. Detectar cambios, marcar naves modificadas y notificar
+    cambios = detect_changes(old_vessels, vessels)
+    log.info("Cambios detectados — nuevas: %d | actualizaciones: %d | blank/omisión: %d",
+             len(cambios["nuevas"]), len(cambios["cambios"]), len(cambios["blank"]))
+
+    # Marcar naves modificadas en la lista (para que el dashboard las resalte)
+    apply_changes_to_vessels(vessels, cambios)
+
+    # Determinar timestamp de último cambio real
+    total_cambios = len(cambios["nuevas"]) + len(cambios["cambios"]) + len(cambios["blank"])
+    if total_cambios > 0:
+        last_changes_at = datetime.now().isoformat()
+        log.info("Último cambio registrado: %s", last_changes_at)
+    else:
+        last_changes_at = prev_last_changes_at  # preservar el anterior
+        log.info("Sin cambios — preservando último cambio: %s", last_changes_at or "ninguno")
+
+    send_notification(cambios)
+
+    # 6. Guardar copia local
     CACHE_DIR.mkdir(exist_ok=True)
     local_json = CACHE_DIR / "data_latest.json"
     local_json.write_text(
-        json.dumps({"vessels": vessels, "updated_at": datetime.now().isoformat()},
+        json.dumps({"vessels": vessels, "updated_at": datetime.now().isoformat(),
+                    "last_changes_at": last_changes_at},
                    ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
     log.info("Copia local guardada: %s", local_json)
 
-    # 5. Publicar en GitHub
-    ok = push_to_github(vessels)
+    # 7. Publicar en GitHub
+    ok = push_to_github(vessels, last_changes_at)
     if ok:
         log.info("═══ Actualización completada exitosamente ═══")
     else:
