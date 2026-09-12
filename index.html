@@ -217,7 +217,7 @@ tbody tr.data-row.sel td{background:var(--blue-bg);box-shadow:inset 3px 0 0 var(
     </div>
     <div class="sync-label"><span class="sdot"></span><span id="sync-ts">Cargando…</span></div>
     <div class="change-label" id="change-label" style="display:none"><span class="cdot"></span><span id="change-ts"></span></div>
-    <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()" title="Verificar actualizaciones">↻ Actualizar</button>
+    <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh(event)" title="Verificar actualizaciones">↻ Actualizar</button>
   </div>
 </header>
 
@@ -582,39 +582,82 @@ setInterval(loadData, 30 * 60 * 1000);
 
 // ─── Refresh manual: dispara GitHub Actions workflow ──
 //
-// TOKEN DE SOLO DISPATCH — permisos: actions:write únicamente
-// en el repo transoceanica-ec/vessel-monitor.
-// No otorga acceso a código, secrets ni otros repos.
-//
-// Pasos para obtenerlo (ver README):
-//   1. github.com → Settings → Developer settings → Fine-grained tokens
-//   2. Nombre: "vessel-monitor-dispatch"
-//   3. Repository access: Only "transoceanica-ec/vessel-monitor"
-//   4. Permissions → Repository permissions → Actions → Read and write
-//   5. Reemplaza DISPATCH_TOKEN_AQUI con el token generado.
-//
-// ⚠ PROTOTIPO: el token queda visible en el HTML público.
-// Para producción, usar un backend proxy o GitHub App.
-const DISPATCH_TOKEN = "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";
-const DISPATCH_REPO  = "transoceanica-ec/vessel-monitor";
-const DISPATCH_WF    = "update.yml";
+// El token de dispatch se guarda en localStorage del navegador.
+// Nunca está hardcodeado en el código fuente (evita revocación por GitHub Secret Scanning).
+// El usuario lo ingresa una sola vez desde el modal de configuración.
+const DISPATCH_REPO = "transoceanica-ec/vessel-monitor";
+const DISPATCH_WF   = "update.yml";
+const TOKEN_KEY     = "vessel_monitor_dispatch_token";
 
-async function manualRefresh() {
+function getDispatchToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch(e) { return ''; }
+}
+function saveDispatchToken(t) {
+  try { localStorage.setItem(TOKEN_KEY, t); } catch(e) {}
+}
+function clearDispatchToken() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch(e) {}
+}
+
+function showTokenModal(onSave) {
+  // Modal para ingresar el token
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9000;display:flex;align-items:center;justify-content:center;`;
+  const box = document.createElement('div');
+  box.style.cssText = `background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:28px 32px;width:480px;max-width:94vw;font-family:'IBM Plex Sans',sans-serif;`;
+  box.innerHTML = `
+    <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:6px;">Configurar token de actualización</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;line-height:1.6;">
+      El token se guarda <strong>solo en este navegador</strong> (localStorage) y nunca en el código.<br>
+      Genera un token clásico en <strong>GitHub → Settings → Developer settings → Tokens (classic)</strong><br>
+      con scope <code style="background:var(--slate-bg);padding:1px 5px;border-radius:3px;">repo</code> y pégalo aquí.
+    </div>
+    <input id="tkn-input" type="password" placeholder="ghp_..." autocomplete="off"
+      style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:'IBM Plex Mono',monospace;font-size:12px;background:var(--surface2);color:var(--text);margin-bottom:14px;box-sizing:border-box;">
+    <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <button id="tkn-cancel" style="padding:6px 16px;border-radius:5px;border:1px solid var(--border);background:var(--surface2);color:var(--text-muted);font-size:12px;cursor:pointer;">Cancelar</button>
+      <button id="tkn-save" style="padding:6px 16px;border-radius:5px;border:none;background:var(--navy);color:#fff;font-size:12px;cursor:pointer;font-weight:600;">Guardar y actualizar</button>
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--text-faint);">
+      Para borrar el token guardado: mantén Shift y haz clic en ↻ Actualizar.
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  const input = box.querySelector('#tkn-input');
+  input.focus();
+  box.querySelector('#tkn-cancel').onclick = () => { overlay.remove(); };
+  box.querySelector('#tkn-save').onclick = () => {
+    const val = input.value.trim();
+    if (!val) { input.style.borderColor='var(--rose)'; return; }
+    saveDispatchToken(val);
+    overlay.remove();
+    if (onSave) onSave(val);
+  };
+  input.onkeydown = (e) => { if (e.key==='Enter') box.querySelector('#tkn-save').click(); };
+}
+
+async function manualRefresh(event) {
   const btn = document.getElementById('refresh-btn');
 
-  // Si el token no está configurado, hacer solo reload de datos
-  if (!DISPATCH_TOKEN || DISPATCH_TOKEN === "DISPATCH_TOKEN_AQUI") {
-    btn.classList.add('spinning');
-    btn.textContent = '↻ Actualizando…';
-    await loadData();
-    setTimeout(() => {
-      btn.classList.remove('spinning');
-      btn.textContent = '↻ Actualizar';
-    }, 800);
-    toast('Sin token configurado', 'Solo se recargaron los datos locales.');
+  // Shift+clic = borrar token guardado
+  if (event && event.shiftKey) {
+    clearDispatchToken();
+    toast('Token eliminado', 'El token fue borrado de este navegador.');
     return;
   }
 
+  const token = getDispatchToken();
+
+  // Sin token → mostrar modal para ingresarlo
+  if (!token) {
+    showTokenModal(async (t) => { await doDispatch(t, btn); });
+    return;
+  }
+
+  await doDispatch(token, btn);
+}
+
+async function doDispatch(token, btn) {
   btn.classList.add('spinning');
   btn.textContent = '↻ Solicitando…';
 
@@ -624,7 +667,7 @@ async function manualRefresh() {
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${DISPATCH_TOKEN}`,
+          'Authorization': `Bearer ${token}`,
           'Accept': 'application/vnd.github+json',
           'Content-Type': 'application/json',
           'X-GitHub-Api-Version': '2022-11-28',
@@ -637,20 +680,23 @@ async function manualRefresh() {
     );
 
     if (res.status === 204) {
-      // 204 No Content = workflow disparado correctamente
       toast('Actualización en proceso', 'El script está corriendo. Los datos se actualizarán en ~60 segundos.');
       btn.textContent = '↻ En proceso…';
-      // Esperar 65 segundos y recargar los datos
       setTimeout(async () => {
         await loadData();
         btn.classList.remove('spinning');
         btn.textContent = '↻ Actualizar';
         toast('Datos actualizados', 'Se cargaron los datos más recientes.');
       }, 65000);
+    } else if (res.status === 401) {
+      clearDispatchToken();
+      toast('Token inválido', 'El token fue rechazado y borrado. Haz clic en ↻ para ingresar uno nuevo.');
+      btn.classList.remove('spinning');
+      btn.textContent = '↻ Actualizar';
     } else {
       const txt = await res.text();
       console.error('GitHub dispatch error:', res.status, txt);
-      toast('Error al disparar', `HTTP ${res.status} — revisa el token DISPATCH_TOKEN.`);
+      toast('Error al disparar', `HTTP ${res.status} — intenta de nuevo o revisa el token.`);
       btn.classList.remove('spinning');
       btn.textContent = '↻ Actualizar';
     }
