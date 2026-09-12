@@ -29,6 +29,7 @@ jobs:
         env:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          TZ: America/Guayaquil
         run: python update_vessels.py
 
       - name: Commit y push data.json
