@@ -1,7 +1,39 @@
-vessel-monitor\
-  .github\
-    workflows\
-      update.yml    ← pegar aquí
-  update_vessels.py
-  index.html
-  data.json
+on:
+  workflow_dispatch:
+    inputs:
+      motivo:
+        description: 'Razón del disparo manual'
+        required: false
+        default: ''
+  schedule:
+    - cron: "0 * * * 1-5"
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install pdfplumber requests
+
+      - name: Ejecutar script
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python update_vessels.py
+
+      - name: Commit y push data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git diff --cached --quiet || git commit -m "auto-update $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
